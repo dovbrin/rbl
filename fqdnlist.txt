@@ -1,9 +1,9 @@
 45.144.31.57
+94.198.40.4
 stock.adobe-service.net
 app.turkmensk.org
-94.198.40.4
-stock.adobe-service.net/homepage/index.aspx 
-app.turkmensk.org/homepage/index.aspx 
+stock.adobe-service.net
+app.turkmensk.org
 account.drive-google-com.tk
 account.gommask.online
 livingthemiraculouslife.com
