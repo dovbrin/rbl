@@ -1,3 +1,6 @@
+gateway.storjshare.io
+link.storjshare.io
+storjshare.io
 kysg4.xyz
 dgmyb.xyz
 etsjyehsze.xyz
