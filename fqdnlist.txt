@@ -1,3 +1,4 @@
+mega.nz
 gateway.storjshare.io
 link.storjshare.io
 storjshare.io
