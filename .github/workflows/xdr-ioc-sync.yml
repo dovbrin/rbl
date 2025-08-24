@@ -5,8 +5,9 @@ on:
     paths:
       - 'fqdnlist.txt'
       - 'iplist.txt'
-      - 'hashlist.txt'
-workflow_dispatch:
+      - 'hashlist.txt'      
+  workflow_dispatch:
+
 jobs:
   sync:
     runs-on: ubuntu-latest
