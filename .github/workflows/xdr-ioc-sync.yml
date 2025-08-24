@@ -6,7 +6,7 @@ on:
       - 'fqdnlist.txt'
       - 'iplist.txt'
       - 'hashlist.txt'      
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   sync:
@@ -28,7 +28,7 @@ jobs:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
           XDR_API_ID:   ${{ secrets.XDR_API_ID }}
           XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          # read the TXT files from repo root:
+          # files are in repo root:
           SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt,hashlist (1).txt"
           VENDOR: ONO-RBL
           SEVERITY: high
