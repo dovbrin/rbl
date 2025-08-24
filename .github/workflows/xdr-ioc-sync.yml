@@ -1,0 +1,29 @@
+name: Sync RBL to Cortex XDR
+on:
+  push:
+    paths:
+      - 'lists/**.txt'
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+      - name: Push IOCs to Cortex XDR
+        env:
+          XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
+          XDR_API_ID:   ${{ secrets.XDR_API_ID }}
+          XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
+          SOURCES: lists/blocklist.txt,lists/urls.txt   # adjust to your files
+          VENDOR: ONO-RBL
+          SEVERITY: high
+          BATCH_SIZE: '1000'
+          COMMENT_TAG: Imported from GitHub
+        run: |
+          python xdr_ioc_upsert_from_sources.py
