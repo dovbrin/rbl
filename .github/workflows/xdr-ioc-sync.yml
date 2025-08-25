@@ -8,6 +8,21 @@ on:
       - 'hashlist.txt'      
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
+concurrency:
+  group: xdr-ioc-sync
+  cancel-in-progress: false
+
+env:
+  VENDOR: "ONO-RBL"
+  SEVERITY: "HIGH"               # INFO | LOW | MEDIUM | HIGH | CRITICAL
+  REPUTATION: "BAD"              # GOOD | BAD | SUSPICIOUS | UNKNOWN | NO_REPUTATION
+  BATCH_SIZE: "500"
+  COMMENT_TAG: "Imported from GitHub"
+  SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt"
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -18,21 +33,148 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Push IOCs to Cortex XDR
+      - name: Push IOCs to Cortex XDR (inline)
         env:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
           XDR_API_ID:   ${{ secrets.XDR_API_ID }}
           XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          # files are in repo root:
-          SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt,hashlist (1).txt"
-          VENDOR: ONO-RBL
-          SEVERITY: high
-          BATCH_SIZE: '1000'
-          COMMENT_TAG: Imported from GitHub
         run: |
-          python xdr_ioc_upsert_from_sources.py
+          python - <<'PY'
+          import os, re, json, time, pathlib, sys
+          from urllib.parse import urlparse
+          import requests
+
+          # --- config from env ---
+          BASE   = os.environ["XDR_BASE_URL"].rstrip("/")
+          APIID  = os.environ["XDR_API_ID"]
+          APIKEY = os.environ["XDR_API_KEY"]
+          VENDOR = os.environ.get("VENDOR","ONO-RBL")
+          SEV    = os.environ.get("SEVERITY","HIGH").upper()
+          REP    = os.environ.get("REPUTATION","BAD").upper()
+          BSZ    = int(os.environ.get("BATCH_SIZE","500"))
+          CTAG   = os.environ.get("COMMENT_TAG","Imported from GitHub")
+          SOURCES= [s.strip() for s in os.environ.get("SOURCES","").split(",") if s.strip()]
+
+          def hdrs():
+              return {"Authorization": APIKEY, "x-xdr-auth-id": APIID, "Content-Type": "application/json"}
+
+          # --- parsers ---
+          re_ipv4   = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)$")
+          re_md5    = re.compile(r"^[a-fA-F0-9]{32}$")
+          re_sha256 = re.compile(r"^[a-fA-F0-9]{64}$")
+          re_domain = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.[A-Za-z0-9-]{1,63})+$")
+
+          def norm_line(s:str)->str:
+              s = s.strip()
+              if not s: return ""
+              s = re.split(r"[\s,|]+", s)[0]
+              return s.strip("[]()<>{}\"'")
+
+          def host_from_url(u:str):
+              try:
+                  if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", u):
+                      u = "http://" + u
+                  return urlparse(u).hostname
+              except Exception:
+                  return None
+
+          def classify(token:str):
+              t = token
+              # Treat /32 as host; skip other CIDRs
+              if re.search(r"/\d{1,2}$", t):
+                  if t.endswith("/32"): t = t.rsplit("/",1)[0]
+                  else: return None
+              if re_ipv4.match(t): return (t, "IP")
+              if re_md5.match(t) or re_sha256.match(t): return (t, "HASH")
+              host = host_from_url(t) or t
+              if all(32 <= ord(c) < 127 for c in host) and re_domain.match(host):
+                  return (host.lower(), "DOMAIN_NAME")
+              return None
+
+          # --- read sources ---
+          parsed, rejects = [], []
+          total = 0
+          for path in SOURCES:
+              p = pathlib.Path(path)
+              if not p.exists():
+                  print(f"[warn] missing file: {p}")
+                  continue
+              print(f"[src] {p}")
+              with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                  for line in f:
+                      total += 1
+                      s = norm_line(line)
+                      if not s or s.startswith("#"): continue
+                      c = classify(s)
+                      if c is None:
+                          rejects.append({"line": s, "reason": "unrecognized/CIDR/SHA1"})
+                          continue
+                      parsed.append(c)
+
+          if not parsed and not rejects:
+              print("::warning::No indicators found in provided SOURCES.")
+              sys.exit(0)
+
+          # de-dupe
+          seen = set()
+          items = []
+          for val, typ in parsed:
+              k = (val, typ)
+              if k in seen: continue
+              seen.add(k)
+              items.append({
+                  "indicator": val,
+                  "type": typ,                         # IP | DOMAIN_NAME | HASH | FILENAME
+                  "severity": SEV,                     # INFO/LOW/MEDIUM/HIGH/CRITICAL
+                  "reputation": REP,                   # GOOD/BAD/SUSPICIOUS/UNKNOWN/NO_REPUTATION
+                  "comment": CTAG,
+                  "vendor": {"name": VENDOR}
+              })
+
+          print(f"[parse] lines={total} parsed={len(items)} rejected={len(rejects)}")
+
+          url = f"{BASE}/public_api/v1/indicators/insert_jsons"
+
+          def post_batch(batch):
+              payload = {"request_data": {"indicators": batch}}
+              backoff = 2
+              for attempt in range(1,7):
+                  try:
+                      r = requests.post(url, headers=hdrs(), json=payload, timeout=90)
+                  except requests.RequestException as e:
+                      if attempt == 6: raise SystemExit(f"[batch] network error: {e}")
+                      print(f"[net] {e} (attempt {attempt}/6) sleeping {backoff}s")
+                      time.sleep(backoff); backoff = min(backoff*2, 60); continue
+                  if r.status_code in (429,503,504):
+                      ra = int(r.headers.get("Retry-After","0") or "0")
+                      sleep = ra if ra>0 else backoff
+                      print(f"[throttle] {r.status_code} sleeping {sleep}s (attempt {attempt}/6)")
+                      time.sleep(sleep); backoff = min(backoff*2, 60); continue
+                  if not r.ok:
+                      raise SystemExit(f"[batch] ERROR: HTTP {r.status_code}: {r.text[:400]}")
+                  # Many tenants return just {"reply": true}; accept that
+                  _ = r.json()
+                  return
+
+          uploaded = 0
+          for i in range(0, len(items), BSZ):
+              chunk = items[i:i+BSZ]
+              print(f"[batch] {i+1}-{i+len(chunk)} / {len(items)}")
+              post_batch(chunk)
+              uploaded += len(chunk)
+
+          # Save rejects as an artifact
+          pathlib.Path("artifacts").mkdir(exist_ok=True)
+          with open("artifacts/rejects.json", "w", encoding="utf-8") as f:
+              json.dump({"rejected": rejects}, f, ensure_ascii=False, indent=2)
+
+          print(f"[done] uploaded={uploaded} rejected_parse={len(rejects)}")
+          PY
+
+      - name: Upload rejects (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdr-rejects
+          path: artifacts/rejects.json
+          if-no-files-found: ignore
