@@ -1,0 +1,186 @@
+name: Sync RBL to Cortex XDR
+
+on:
+  push:
+    paths:
+      - 'fqdnlist.txt'
+      - 'iplist.txt'
+      - 'hashlist.txt'
+      - 'hashlist (1).txt'
+      - '.github/workflows/xdr-ioc-sync.yml'
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      # === Your existing upload step (leave as-is if you already have a script) ===
+      - name: Push IOCs to Cortex XDR
+        env:
+          XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
+          XDR_API_ID:   ${{ secrets.XDR_API_ID }}
+          XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
+          SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt,hashlist (1).txt"
+          VENDOR: ONO-RBL
+          SEVERITY: high
+          BATCH_SIZE: '1000'
+          COMMENT_TAG: Imported from GitHub
+        run: |
+          # If you have a repo script, call it; otherwise keep your inline uploader here.
+          python xdr_ioc_upsert_from_sources.py
+
+      # === Option 1: Insert a canary IOC and verify it appears ===
+      - name: Verify IOC visibility (insert & list)
+        env:
+          XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
+          XDR_API_ID:   ${{ secrets.XDR_API_ID }}
+          XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
+          VENDOR:       ONO-RBL
+          COMMENT_TAG:  "GitHub sync test"
+        run: |
+          python - <<'PY'
+          import os, sys, time, json, requests
+          from datetime import datetime, timezone
+
+          BASE = os.environ["XDR_BASE_URL"].rstrip("/")
+          API_ID = os.environ["XDR_API_ID"]
+          API_KEY = os.environ["XDR_API_KEY"]
+          VENDOR = os.getenv("VENDOR", "ONO-RBL")
+          COMMENT = os.getenv("COMMENT_TAG", "GitHub sync test")
+
+          H = {
+            "Authorization": API_KEY,
+            "x-xdr-auth-id": API_ID,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+          }
+
+          def post_json(uri, payload, max_retries=6, timeout=120):
+            backoff = 2
+            for attempt in range(1, max_retries+1):
+              try:
+                r = requests.post(uri, headers=H, json=payload, timeout=timeout)
+                if r.status_code in (429, 500, 502, 503, 504, 599):
+                  ra = r.headers.get("Retry-After")
+                  sleep = int(ra) if ra and ra.isdigit() else backoff
+                  print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {attempt}/{max_retries})")
+                  time.sleep(sleep)
+                  backoff = min(int(backoff*2.2), 90)
+                  continue
+                r.raise_for_status()
+                return r.json()
+              except requests.RequestException as e:
+                # On last attempt, raise
+                if attempt == max_retries:
+                  raise
+                print(f"[retry] {e}; backing off {backoff}s (attempt {attempt}/{max_retries})")
+                time.sleep(backoff)
+                backoff = min(int(backoff*2.2), 90)
+
+          # 1) Insert canary
+          canary = f"ono-rbl-canary-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.example"
+          ins_uri = f"{BASE}/public_api/v1/indicators/insert_jsons"
+          ins_body = {
+            "request_data": {
+              "indicators": [{
+                "indicator":  canary,
+                "type":       "DOMAIN_NAME",
+                "severity":   "MEDIUM",
+                "reputation": "BAD",
+                "comment":    COMMENT,
+                "vendor":     {"name": VENDOR},
+              }]
+            }
+          }
+          print(f"[insert] {canary}")
+          ins = post_json(ins_uri, ins_body)
+          if not ins.get("reply", False):
+            print("[insert] reply was not True; failing.")
+            sys.exit(2)
+          print("[insert] ACK reply=True")
+
+          # 2) Exact-match lookup (allowing for indexing lag)
+          get_uri = f"{BASE}/public_api/v1/indicators/get"
+          found = None
+          for i in range(12):  # ~2 min total
+            body = {"request_data": {
+              "search_from": 0, "search_to": 50,
+              "filters": [{"field": "indicator", "operator": "eq", "value": canary}]
+            }}
+            try:
+              js = post_json(get_uri, body, max_retries=3, timeout=90)
+              items = js.get("reply", {}).get("indicators", []) or []
+              if items:
+                found = items[0]
+                break
+            except Exception:
+              pass
+            time.sleep(10)
+
+          # 3) If not yet visible, page newest across both endpoints and search locally
+          if not found:
+            print("Exact match not visible yet; paging newest sets across endpoints…")
+            endpoints = [
+              f"{BASE}/public_api/v1/indicators/get",
+              f"{BASE}/public_api/v1/indicators/get_indicators/"
+            ]
+            for ep in endpoints:
+              search_from = 0
+              for _ in range(5):  # up to 5*100 items per endpoint
+                body = {"request_data": {
+                  "search_from": search_from,
+                  "search_to": search_from + 100,
+                  "sort": {"field": "creation_time", "keyword": "desc"}
+                }}
+                try:
+                  js = post_json(ep, body, max_retries=3, timeout=90)
+                except Exception as e:
+                  print(f"[HTTP] {ep} failed (from={search_from}): {e}")
+                  break
+                items = js.get("reply", {}).get("indicators", []) or []
+                if not items:
+                  break
+                for it in items:
+                  if it.get("indicator") == canary:
+                    found = it
+                    break
+                if found:
+                  break
+                search_from += 100
+              if found:
+                break
+
+          if found:
+            def vendor_name(v):
+              if isinstance(v, str): return v
+              if isinstance(v, dict): return v.get("name") or ""
+              return ""
+            print("FOUND:")
+            print(json.dumps({
+              "indicator": found.get("indicator"),
+              "type": found.get("type"),
+              "severity": found.get("severity"),
+              "vendor": vendor_name(found.get("vendor")),
+              "comment": found.get("comment"),
+              "creation_time": found.get("creation_time"),
+            }, indent=2))
+            sys.exit(0)
+
+          print("Canary not visible via list API yet.\n"
+                f"- Tenant/region mismatch? BASE={BASE}\n"
+                f"- Check GUI: Threat Management → Detection Rules → IOC; sort by Creation Time (desc) and search for: {canary}")
+          sys.exit(1)
+          PY
