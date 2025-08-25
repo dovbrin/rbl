@@ -1,212 +1,222 @@
 # xdr_ioc_upsert_from_sources.py
-import os, re, json, time, pathlib, ipaddress, base64
-from typing import List, Dict
-from urllib.parse import urlparse
+# Push IOCs from flat text files to Cortex XDR using /indicators/insert_jsons
+# - Reads SOURCES env (comma-separated file names in repo root)
+# - Supports DOMAIN_NAME, IP (single IP only), HASH (md5/sha1/sha256)
+# - Skips CIDR/ranges and malformed lines, emits a rejects JSONL file
+# - Uses small batches + keep-alive + backoff; retries 429/5xx/599
+
+import os, re, sys, json, time, hashlib, ipaddress, random
+from typing import List, Tuple, Dict
 import requests
-from ftplib import FTP
-try:
-    import paramiko  # optional for sftp:// sources
-except Exception:
-    paramiko = None
 
-# --- tiny env loader (for local runs; Actions will pass env) ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-def load_env(path: str):
-    if not os.path.exists(path): return
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s: continue
-            k, v = s.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-load_env(os.path.join(BASE_DIR, ".env"))
+BASE   = os.environ["XDR_BASE_URL"].rstrip("/")
+API_ID = os.environ["XDR_API_ID"]
+APIKEY = os.environ["XDR_API_KEY"]
 
-# --- config ---
-BASE    = os.environ["XDR_BASE_URL"].rstrip("/")
-APIID   = os.environ["XDR_API_ID"]
-APIKEY  = os.environ["XDR_API_KEY"]
 SOURCES = [s.strip() for s in os.environ.get("SOURCES","").split(",") if s.strip()]
-if not SOURCES:
-    raise SystemExit("Set SOURCES (comma-separated paths/URLs)")
+VENDOR  = os.environ.get("VENDOR","ONO-RBL")
+SEVERITY= os.environ.get("SEVERITY","high").upper()       # INFO/LOW/MEDIUM/HIGH/CRITICAL
+COMMENT = os.environ.get("COMMENT_TAG","Imported from GitHub")
+BATCH_SIZE = max(50, min( int(os.environ.get("BATCH_SIZE","200")), 1000 ))
 
-VENDOR     = os.environ.get("VENDOR", "Custom-RBL")
-SEVERITY   = os.environ.get("SEVERITY", "high").lower()
-BATCH_SIZE = max(1, int(os.environ.get("BATCH_SIZE", "1000")))
-COMMENT    = os.environ.get("COMMENT_TAG", "Imported via GitHub")
+OUT_REJECTS = os.environ.get("REJECTS_PATH","artifacts/rejects.json")
+os.makedirs(os.path.dirname(OUT_REJECTS), exist_ok=True)
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # only if you use gh:// private paths
+# ---------- helpers ----------
+_dom_re = re.compile(r"^(?=.{1,253}$)(?!-)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$")
+_hex_re = re.compile(r"^[0-9a-fA-F]+$")
 
-# --- XDR API helpers ---
-def headers():
-    return {"Authorization": APIKEY, "x-xdr-auth-id": APIID, "Content-Type": "application/json"}
+def is_hash(s: str) -> Tuple[bool,str]:
+    n = len(s)
+    if n == 32 and _hex_re.match(s):   return True, "HASH"     # md5
+    if n == 40 and _hex_re.match(s):   return True, "HASH"     # sha1
+    if n == 64 and _hex_re.match(s):   return True, "HASH"     # sha256
+    return False, ""
 
-CANDIDATE_ENDPOINTS = [
-    f"{BASE}/public_api/v1/indicators/insert",
-    f"{BASE}/public_api/v1/indicators/upsert",
-    f"{BASE}/public_api/v1/indicators/insert_simple",
-]
+def to_record(line: str) -> Tuple[Dict, str]:
+    """Return (record, reject_reason). record is None when reject_reason set."""
+    raw = line.strip()
+    if not raw: return None, "empty"
+    # remove trailing commas/spaces
+    raw = raw.strip(", ").strip()
+    # reject obvious junk
+    if any(c in raw for c in [" ", "\t", "/", "\\", "http://", "https://"]):
+        # CIDR or URL or path — not supported
+        # but allow a single IPv6 which contains ":" — handle separately
+        if ":" in raw and "://" not in raw and "/" not in raw:
+            # try IPv6 ip
+            try:
+                ipaddress.ip_address(raw)
+                return {
+                    "indicator": raw,
+                    "type": "IP",
+                    "severity": SEVERITY,
+                    "reputation": "BAD",
+                    "vendor": {"name": VENDOR},
+                    "comment": COMMENT
+                }, ""
+            except Exception:
+                return None, "unknown format"
+        return None, "unknown format"
 
-def post_with_retry(url: str, payload: dict):
-    r = requests.post(url, headers=headers(), json=payload, timeout=120)
-    if r.status_code == 429:
-        ra = int(r.headers.get("Retry-After","5") or "5"); time.sleep(ra)
-        r = requests.post(url, headers=headers(), json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()
+    # IP (v4)
+    try:
+        ipaddress.ip_address(raw)
+        return {
+            "indicator": raw,
+            "type": "IP",
+            "severity": SEVERITY,
+            "reputation": "BAD",
+            "vendor": {"name": VENDOR},
+            "comment": COMMENT
+        }, ""
+    except Exception:
+        pass
 
-def pick_endpoint(sample: dict) -> str:
-    last = None
-    for ep in CANDIDATE_ENDPOINTS:
+    # Domain
+    if _dom_re.match(raw):
+        # basic ASCII domains only; non-ASCII will be skipped
         try:
-            _ = post_with_retry(ep, sample)
-            return ep
-        except Exception as e:
-            last = str(e)
-            # Some tenants error on duplicates—still usable. Use first candidate.
-            return ep
-    raise SystemExit(f"No working IOC endpoint; last error: {last}")
+            raw.encode("ascii")
+        except Exception:
+            return None, "non-ascii domain"
+        return {
+            "indicator": raw.lower(),
+            "type": "DOMAIN_NAME",
+            "severity": SEVERITY,
+            "reputation": "BAD",
+            "vendor": {"name": VENDOR},
+            "comment": COMMENT
+        }, ""
 
-# --- indicator parsing ---
-MD5_RE     = re.compile(r"^[a-fA-F0-9]{32}$")
-SHA256_RE  = re.compile(r"^[a-fA-F0-9]{64}$")
-URL_RE     = re.compile(r"^https?://", re.I)
-DOMAIN_RE  = re.compile(r"^(?=.{1,253}$)(?!-)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$")
+    # Hash
+    ok, typ = is_hash(raw)
+    if ok:
+        return {
+            "indicator": raw.lower(),
+            "type": "HASH",
+            "severity": SEVERITY,
+            "reputation": "BAD",
+            "vendor": {"name": VENDOR},
+            "comment": COMMENT
+        }, ""
 
-def detect_type(s: str):
-    s = s.strip()
-    if not s: return None
-    if URL_RE.match(s): return "url"
-    try:
-        ip = ipaddress.ip_address(s)
-        return "ipv4" if ip.version == 4 else "ipv6"
-    except ValueError:
-        pass
-    try:
-        ipaddress.ip_network(s, strict=False)
-        return "cidr"  # not supported in XDR IOC; skip
-    except ValueError:
-        pass
-    if MD5_RE.match(s): return "md5"
-    if SHA256_RE.match(s): return "sha256"
-    if DOMAIN_RE.match(s): return "domain"
-    return None
+    return None, "unknown format"
 
-def to_iocs(text: str) -> List[Dict]:
-    out: List[Dict] = []
-    for line in text.splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"): continue
-        t = detect_type(s)
-        if t in (None, "cidr"):
-            if t == "cidr": print(f"[skip] CIDR not supported: {s}")
-            else: print(f"[skip] unknown format: {s}")
-            continue
-        out.append({"indicator": s, "type": t, "severity": SEVERITY,
-                    "vendor": VENDOR, "comment": COMMENT})
-    return out
+def parse_sources(files: List[str]) -> Tuple[List[Dict], List[Dict]]:
+    recs, rejects = [], []
+    total_lines = 0
+    for fn in files:
+        print(f"[src] {fn}")
+        try:
+            with open(fn, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    total_lines += 1
+                    rec, why = to_record(line)
+                    if rec:
+                        recs.append(rec)
+                    else:
+                        rejects.append({"line": line.strip(), "reason": why, "source": fn})
+        except FileNotFoundError:
+            print(f"[warn] missing file: {fn}")
+    print(f"[parse] lines={total_lines} parsed={len(recs)} rejected={len(rejects)}")
+    return recs, rejects
 
-# --- source fetchers (repo paths / http / ftp / sftp / gh://) ---
-def fetch_local(path: str) -> str:
-    p = pathlib.Path(path)
-    if not p.is_file():
-        raise FileNotFoundError(f"Local file not found: {p}")
-    return p.read_text(encoding="utf-8")
-
-def fetch_http(url: str) -> str:
-    r = requests.get(url, timeout=90); r.raise_for_status(); return r.text
-
-def fetch_ftp(url: str) -> str:
-    from ftplib import FTP
-    u = urlparse(url); host, port = u.hostname, u.port or 21
-    user, pwd, path = u.username or "anonymous", u.password or "anon@", u.path
-    buf = []
-    with FTP() as ftp:
-        ftp.connect(host, port, timeout=30); ftp.login(user, pwd); ftp.retrlines(f"RETR {path}", buf.append)
-    return "\n".join(buf)
-
-def fetch_sftp(url: str) -> str:
-    if paramiko is None:
-        raise RuntimeError("SFTP requires paramiko (pip install paramiko)")
-    u = urlparse(url); host, port = u.hostname, u.port or 22
-    user, pwd, path = u.username or "", u.password or "", u.path
-    t = paramiko.Transport((host, port)); t.connect(username=user, password=pwd)
-    sftp = paramiko.SFTPClient.from_transport(t)
-    try:
-        with sftp.open(path, "r") as f: return f.read().decode("utf-8")
-    finally:
-        sftp.close(); t.close()
-
-def fetch_github_api(gh: str) -> str:
-    # gh://owner/repo/path/to/file@branch
-    spec = gh[5:]; ref=None
-    if "@" in spec: spec, ref = spec.split("@",1)
-    owner, repo, path = spec.split("/",2)
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    hdrs = {"Accept":"application/vnd.github.v3.raw"}
-    if GITHUB_TOKEN: hdrs["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    r = requests.get(url, headers=hdrs, params={"ref":ref} if ref else None, timeout=60)
-    if r.ok and r.headers.get("Content-Type","").startswith("application/vnd.github.v3.raw"):
-        return r.text
-    r.raise_for_status()
-    j = r.json()
-    if j.get("encoding")=="base64": return base64.b64decode(j["content"]).decode("utf-8")
-    raise RuntimeError("Unexpected GitHub response")
-
-def fetch_source(src: str) -> str:
-    s = src.lower()
-    if s.startswith("http://") or s.startswith("https://"): return fetch_http(src)
-    if s.startswith("ftp://"):  return fetch_ftp(src)
-    if s.startswith("sftp://"): return fetch_sftp(src)
-    if s.startswith("gh://"):   return fetch_github_api(src)
-    return fetch_local(src)
-
-# --- upload ---
-def dedupe(inds: List[Dict]) -> List[Dict]:
-    seen=set(); out=[]
-    for i in inds:
-        key=(i["type"], i["indicator"])
+def dedupe(recs: List[Dict]) -> List[Dict]:
+    seen = set()
+    out = []
+    for r in recs:
+        key = (r["indicator"], r["type"])
         if key in seen: continue
-        seen.add(key); out.append(i)
+        seen.add(key); out.append(r)
     return out
 
-def batches(items: List[Dict], n: int):
-    for i in range(0, len(items), n):
-        yield items[i:i+n]
+# ---------- HTTP ----------
+S = requests.Session()
+S.headers.update({
+    "Authorization": APIKEY,
+    "x-xdr-auth-id": API_ID,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Connection": "keep-alive",
+})
+INSERT_URI = f"{BASE}/public_api/v1/indicators/insert_jsons"  # <- force the stable endpoint
 
-def upload(inds: List[Dict]):
-    if not inds:
-        print("Nothing to upload."); return
-    ep = pick_endpoint({"request_data":{"indicators": inds[:1]}})
-    print(f"Using endpoint: {ep}")
-    sent=0; failed=0
-    for chunk in batches(inds, BATCH_SIZE):
-        payload={"request_data":{"indicators":chunk}}
+def post_json(uri: str, payload: Dict, retries: int = 6) -> Dict:
+    backoff = 2.0
+    for attempt in range(1, retries+1):
         try:
-            resp = post_with_retry(ep, payload)
-            reply = resp.get("reply", resp) if isinstance(resp, dict) else {}
-            ok   = len(reply.get("success_list", [])) if isinstance(reply, dict) else len(chunk)
-            fail = len(reply.get("failure_list", [])) if isinstance(reply, dict) else 0
-            sent += ok; failed += fail
-            print(f"[batch] uploaded={ok} failed={fail}")
+            r = S.post(uri, json=payload, timeout=120)
+            if r.status_code in (429, 500, 502, 503, 504, 599):
+                ra = r.headers.get("Retry-After")
+                sleep = int(ra) if ra and ra.isdigit() else backoff
+                print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {attempt}/{retries})")
+                time.sleep(sleep)
+                backoff = min(backoff * 2.0, 90.0)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            if attempt == retries:
+                raise
+            sleep = backoff + random.random()
+            print(f"[retry] {e}; backoff {sleep:.1f}s (attempt {attempt}/{retries})")
+            time.sleep(sleep)
+            backoff = min(backoff * 2.0, 90.0)
+    return {}
+
+# ---------- main ----------
+def main():
+    if not SOURCES:
+        print("No SOURCES provided.")
+        sys.exit(1)
+
+    recs, rejects = parse_sources(SOURCES)
+    recs = dedupe(recs)
+    print(f"Total after dedupe: {len(recs)}")
+    print(f"Using endpoint: {INSERT_URI}")
+
+    uploaded = 0
+    failed   = 0
+    # small batches reduce 5xx/599 probability
+    for i in range(0, len(recs), BATCH_SIZE):
+        chunk = recs[i:i+BATCH_SIZE]
+        print(f"[batch] {i+1}-{i+len(chunk)} / {len(recs)}")
+        body = {"request_data": {"indicators": chunk}}
+        try:
+            js = post_json(INSERT_URI, body)
+            # Success path: reply true OR per-item result array (both patterns appear)
+            ok = False
+            if isinstance(js, dict):
+                if js.get("reply") is True:
+                    ok = True
+                elif isinstance(js.get("reply"), list):
+                    # Some tenants return an array of result dicts
+                    ok = all(x.get("succeeded", True) for x in js["reply"])
+            if not ok:
+                # treat as soft failure; capture detail
+                failed += len(chunk)
+                rejects.append({"batch_start": i+1, "reason": f"server_reply={js}"})
+            else:
+                uploaded += len(chunk)
         except Exception as e:
             failed += len(chunk)
-            print(f"[batch] ERROR: {e}")
-    print(f"Done. Uploaded={sent} Failed={failed}")
+            rejects.append({"batch_start": i+1, "error": str(e)})
+        # gentle pacing
+        time.sleep(0.35)
 
-def main():
-    all_inds=[]
-    for src in SOURCES:
-        try:
-            print(f"[src] {src}")
-            text = fetch_source(src)
-            inds = to_iocs(text)
-            print(f"[src] parsed {len(inds)} indicators")
-            all_inds.extend(inds)
-        except Exception as e:
-            print(f"[src] ERROR: {e}")
-    all_inds = dedupe(all_inds)
-    print(f"Total after dedupe: {len(all_inds)}")
-    upload(all_inds)
+    # write rejects (if any)
+    if rejects:
+        with open(OUT_REJECTS, "w", encoding="utf-8") as f:
+            for r in rejects:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"[rejects] saved to {OUT_REJECTS}")
+
+    print(f"[done] uploaded={uploaded} rejected_parse={sum(1 for r in rejects if 'line' in r)}")
+    # consider non-zero exit only if zero were uploaded AND we had network errors
+    if uploaded == 0:
+        # keep non-zero so the Summary shows attention, but your workflow can choose to continue
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
