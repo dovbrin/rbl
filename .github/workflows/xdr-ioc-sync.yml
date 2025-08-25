@@ -6,7 +6,6 @@ on:
       - 'fqdnlist.txt'
       - 'iplist.txt'
       - 'hashlist.txt'
-      - 'hashlist (1).txt'
       - '.github/workflows/xdr-ioc-sync.yml'
   workflow_dispatch: {}
 
@@ -33,7 +32,7 @@ jobs:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
           XDR_API_ID:   ${{ secrets.XDR_API_ID }}
           XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt,hashlist (1).txt"
+          SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt"
           VENDOR: ONO-RBL
           SEVERITY: high
           BATCH_SIZE: '1000'
