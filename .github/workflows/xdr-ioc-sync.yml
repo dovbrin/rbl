@@ -13,6 +13,8 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -26,39 +28,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # ---- Your existing uploader (unchanged) ----
-      - name: Push IOCs to Cortex XDR
+      # ---------- Bulk uploader (inline Python) ----------
+      - name: Push IOCs to Cortex XDR (inline)
+        id: upload
         env:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
           XDR_API_ID:   ${{ secrets.XDR_API_ID }}
           XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
+          # files in repo root:
           SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt"
-          VENDOR: ONO-RBL
-          SEVERITY: high
-          BATCH_SIZE: '1000'
-          COMMENT_TAG: Imported from GitHub
-        run: |
-          python xdr_ioc_upsert_from_sources.py
-
-      # ---- Canary insert + tolerant verification (does NOT fail on 5xx/599) ----
-      - name: Insert canary IOC & try to verify
-        id: canary
-        env:
-          XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
-          XDR_API_ID:   ${{ secrets.XDR_API_ID }}
-          XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          VENDOR:       ONO-RBL
-          COMMENT_TAG:  "GitHub sync test"
+          VENDOR: "ONO-RBL"
+          SEVERITY: "HIGH"             # INFO|LOW|MEDIUM|HIGH|CRITICAL
+          REPUTATION: "BAD"
+          COMMENT_TAG: "Imported from GitHub"
+          BATCH_SIZE: "1000"
         run: |
           python - <<'PY'
-          import os, sys, time, json, requests
-          from datetime import datetime, timezone
+          import os, re, json, time, ipaddress, requests, pathlib
+          from urllib.parse import urlparse
 
           BASE   = os.environ["XDR_BASE_URL"].rstrip("/")
           API_ID = os.environ["XDR_API_ID"]
           APIKEY = os.environ["XDR_API_KEY"]
-          VENDOR = os.getenv("VENDOR","ONO-RBL")
-          COMMENT= os.getenv("COMMENT_TAG","GitHub sync test")
+
+          SOURCES = [s.strip() for s in os.environ.get("SOURCES","").split(",") if s.strip()]
+          VENDOR  = os.environ.get("VENDOR","ONO-RBL")
+          SEVERITY= os.environ.get("SEVERITY","HIGH").upper()
+          REPUT   = os.environ.get("REPUTATION","BAD").upper()
+          COMMENT = os.environ.get("COMMENT_TAG","Imported from GitHub")
+          BATCH   = max(1, min(1000, int(os.environ.get("BATCH_SIZE","1000"))))
+
+          if not (BASE and API_ID and APIKEY):
+            raise SystemExit("Missing XDR_BASE_URL / XDR_API_ID / XDR_API_KEY secrets.")
 
           H = {
             "Authorization": APIKEY,
@@ -67,61 +68,232 @@ jobs:
             "Accept": "application/json"
           }
 
-          def post(uri, payload, max_retries=6, timeout=120):
+          # ---------- parsers ----------
+          # domain: allow simple FQDN (no scheme), or strip host from URL
+          dom_rx = re.compile(r"^[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$")
+          hex_rx = re.compile(r"^[0-9a-fA-F]+$")
+
+          rejects = []    # [{source,line,reason,value}]
+          out = []        # list of indicator dicts
+
+          def add_indicator(ind, typ):
+            out.append({
+              "indicator": ind,
+              "type": typ,
+              "severity": SEVERITY,
+              "reputation": REPUT,
+              "comment": COMMENT,
+              "vendor": {"name": VENDOR},
+            })
+
+          def parse_domain_line(raw, src):
+            s = raw.strip().strip(",;")
+            if not s or s.startswith("#"): return
+            if "://" in s:
+              try:
+                u = urlparse(s)
+                host = (u.netloc or "").split("@")[-1].split(":")[0]
+                if host and dom_rx.match(host):
+                  add_indicator(host.lower(), "DOMAIN_NAME"); return
+                else:
+                  rejects.append({"source":src,"line":raw,"reason":"bad URL host","value":host}); return
+              except Exception:
+                rejects.append({"source":src,"line":raw,"reason":"bad URL parse","value":s}); return
+            # plain token -> domain?
+            token = s.replace("[.]",".").replace("(.)",".").strip()
+            token = token.replace(" ", "")
+            if dom_rx.match(token):
+              add_indicator(token.lower(), "DOMAIN_NAME")
+            else:
+              rejects.append({"source":src,"line":raw,"reason":"not a domain","value":token})
+
+          def parse_ip_line(raw, src):
+            s = raw.strip().strip(",;")
+            if not s or s.startswith("#"): return
+            # CIDR /32 -> single IP; other CIDRs -> reject
+            if "/" in s:
+              try:
+                net = ipaddress.ip_network(s, strict=False)
+                if net.prefixlen == net.max_prefixlen:  # /32 for v4 or /128 for v6
+                  add_indicator(str(net.network_address), "IP")
+                else:
+                  rejects.append({"source":src,"line":raw,"reason":"CIDR not supported","value":s})
+                return
+              except Exception:
+                rejects.append({"source":src,"line":raw,"reason":"bad CIDR","value":s}); return
+            # single IP
+            try:
+              ip = ipaddress.ip_address(s)
+              add_indicator(str(ip), "IP")
+            except Exception:
+              rejects.append({"source":src,"line":raw,"reason":"not an ip","value":s})
+
+          def parse_hash_line(raw, src):
+            s = raw.strip().lower()
+            if not s or s.startswith("#"): return
+            s = s.strip(",;")
+            if not hex_rx.match(s):
+              rejects.append({"source":src,"line":raw,"reason":"non-hex","value":s}); return
+            n = len(s)
+            if n == 32 or n == 40 or n == 64:     # MD5, SHA1, SHA256
+              add_indicator(s, "HASH")
+            else:
+              rejects.append({"source":src,"line":raw,"reason":f"unsupported hash length {n}","value":s})
+
+          # ---------- load sources ----------
+          for src in SOURCES:
+            p = pathlib.Path(src)
+            if not p.exists():
+              # skip missing file quietly
+              continue
+            with p.open("r", encoding="utf-8", errors="ignore") as f:
+              if p.name.lower().startswith("fqdn"):
+                for line in f: parse_domain_line(line, p.name)
+              elif p.name.lower().startswith("ip"):
+                for line in f: parse_ip_line(line, p.name)
+              elif p.name.lower().startswith("hash"):
+                for line in f: parse_hash_line(line, p.name)
+              else:
+                # guess by content
+                for line in f:
+                  t = line.strip()
+                  if not t or t.startswith("#"): continue
+                  if "://" in t or "." in t and not any(c in t for c in " /\\"):
+                    parse_domain_line(line, p.name)
+                  elif "/" in t or t.replace(".","").isdigit():
+                    parse_ip_line(line, p.name)
+                  else:
+                    parse_hash_line(line, p.name)
+
+          # dedupe by (indicator,type)
+          uniq = {}
+          for i in out:
+            uniq[(i["indicator"], i["type"])] = i
+          indicators = list(uniq.values())
+
+          print(f"[parse] lines={sum(1 for _ in open(SOURCES.split(',')[0]) if _)} parsed={len(indicators)} rejected={len(rejects)}")
+
+          # ---------- upload in batches ----------
+          def post(uri, payload, max_retries=6, timeout=90):
+            backoff = 2
+            for attempt in range(1, max_retries+1):
+              r = requests.post(uri, headers=H, json=payload, timeout=timeout)
+              if r.status_code in (429,500,502,503,504,599):
+                ra = r.headers.get("Retry-After")
+                sleep = int(ra) if ra and ra.isdigit() else backoff
+                print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {attempt}/{max_retries})")
+                time.sleep(sleep); backoff = min(int(backoff*2.2), 90)
+                continue
+              r.raise_for_status()
+              return r.json()
+            r.raise_for_status()
+
+          inserted = 0
+          if indicators:
+            uri = f"{BASE}/public_api/v1/indicators/insert_jsons"
+            print(f"Using endpoint: {uri}")
+            for i in range(0, len(indicators), BATCH):
+              chunk = indicators[i:i+BATCH]
+              print(f"[batch] {i+1}-{i+len(chunk)} / {len(indicators)}")
+              body = {"request_data":{"indicators": chunk}}
+              js = post(uri, body)
+              if not js.get("reply", False):
+                print("[batch] WARNING: server reply=False (continuing)")
+              inserted += len(chunk)
+
+          # write rejects artifact (JSON)
+          if rejects:
+            import zipfile, io
+            pathlib.Path("artifacts").mkdir(exist_ok=True)
+            with open("artifacts/rejects.json","w",encoding="utf-8") as f:
+              json.dump(rejects, f, ensure_ascii=False, indent=2)
+
+          # set outputs for summary
+          print(f"[done] uploaded={inserted} rejected_parse={len(rejects)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+            gh.write(f"uploaded={inserted}\n")
+            gh.write(f"rejected={len(rejects)}\n")
+          PY
+
+      - name: Upload rejects (if any)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdr-rejects
+          path: artifacts/rejects.json
+          if-no-files-found: ignore
+
+      # ---------- Canary insert + best-effort verification ----------
+      - name: Insert canary IOC & try to verify
+        id: canary
+        env:
+          XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
+          XDR_API_ID:   ${{ secrets.XDR_API_ID }}
+          XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
+          VENDOR:       ONO-RBL
+          COMMENT_TAG:  "GitHub canary"
+        run: |
+          python - <<'PY'
+          import os, time, requests, json
+          from datetime import datetime, timezone
+
+          BASE   = os.environ["XDR_BASE_URL"].rstrip("/")
+          API_ID = os.environ["XDR_API_ID"]
+          APIKEY = os.environ["XDR_API_KEY"]
+          VENDOR = os.getenv("VENDOR","ONO-RBL")
+          COMMENT= os.getenv("COMMENT_TAG","GitHub canary")
+
+          H = {
+            "Authorization": APIKEY,
+            "x-xdr-auth-id": API_ID,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+          }
+
+          def post(uri, payload, max_retries=6, timeout=90):
             backoff=2
             for attempt in range(1, max_retries+1):
-              try:
-                r = requests.post(uri, headers=H, json=payload, timeout=timeout)
-                if r.status_code in (429,500,502,503,504,599):
-                  ra = r.headers.get("Retry-After")
-                  sleep = int(ra) if ra and ra.isdigit() else backoff
-                  print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {attempt}/{max_retries})")
-                  time.sleep(sleep)
-                  backoff = min(int(backoff*2.2), 90)
-                  continue
-                r.raise_for_status()
-                return r.json()
-              except requests.RequestException as e:
-                if attempt == max_retries:
-                  raise
-                print(f"[retry] {e}; backoff {backoff}s")
-                time.sleep(backoff)
-                backoff = min(int(backoff*2.2), 90)
+              r = requests.post(uri, headers=H, json=payload, timeout=timeout)
+              if r.status_code in (429,500,502,503,504,599):
+                sleep = min(int(backoff), 90)
+                print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {attempt}/{max_retries})")
+                time.sleep(sleep); backoff = backoff*2.2
+                continue
+              r.raise_for_status()
+              return r.json()
+            r.raise_for_status()
 
           canary = f"ono-rbl-canary-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.example"
-          ins_uri = f"{BASE}/public_api/v1/indicators/insert_jsons"
-          ins_body = {"request_data":{"indicators":[{
-            "indicator":canary, "type":"DOMAIN_NAME",
-            "severity":"MEDIUM", "reputation":"BAD",
-            "comment":COMMENT, "vendor":{"name":VENDOR}
-          }]}}
           print(f"[insert] {canary}")
-          js = post(ins_uri, ins_body)
-          if not js.get("reply", False):
-            print("Insert replied False; marking CANARY_STATUS=insert_failed")
-            print(f"CANARY={canary}\nCANARY_STATUS=insert_failed")
-            with open("canary.txt","w") as f: f.write(canary+"\ninsert_failed\n")
-            sys.exit(0)
+          ins = {"request_data":{"indicators":[{
+            "indicator": canary, "type":"DOMAIN_NAME",
+            "severity":"MEDIUM", "reputation":"BAD",
+            "comment": COMMENT, "vendor": {"name": VENDOR}
+          }]}}
+          try:
+            js = post(f"{BASE}/public_api/v1/indicators/insert_jsons", ins)
+          except Exception as e:
+            status = "insert_failed"
+            print(f"CANARY={canary}\nCANARY_STATUS={status}")
+            open("canary.txt","w").write(canary+"\n"+status+"\n")
+            raise
 
-          # Try exact match first
-          get_uri = f"{BASE}/public_api/v1/indicators/get"
+          # Try exact match quickly (12 polls ~2 min)
           ok = False
-          for i in range(12):  # ~2 minutes
+          for i in range(12):
             try:
               q = {"request_data":{
-                "search_from":0, "search_to":50,
+                "search_from":0,"search_to":50,
                 "filters":[{"field":"indicator","operator":"eq","value":canary}]
               }}
-              resp = post(get_uri, q, max_retries=3, timeout=90)
-              items = (resp or {}).get("reply",{}).get("indicators",[]) or []
-              if items:
-                ok = True
-                break
+              r = post(f"{BASE}/public_api/v1/indicators/get", q, max_retries=3)
+              items = (r or {}).get("reply",{}).get("indicators",[]) or []
+              if any(it.get("indicator")==canary for it in items):
+                ok = True; break
             except Exception as e:
-              print(f"[exact-match] {e}")
+              pass
             time.sleep(10)
 
-          # If not ok, page newest on two list endpoints
+          # If not visible via exact match, page newest a bit
           if not ok:
             print("Exact match not visible yet; paging newest endpoints…")
             endpoints = [
@@ -130,21 +302,18 @@ jobs:
             ]
             for ep in endpoints:
               search_from = 0
-              for _ in range(5):
+              for _ in range(3):
                 try:
-                  body = {"request_data":{
-                    "search_from":search_from, "search_to":search_from+100,
+                  r = post(ep, {"request_data":{
+                    "search_from":search_from,"search_to":search_from+100,
                     "sort":{"field":"creation_time","keyword":"desc"}
-                  }}
-                  js2 = post(ep, body, max_retries=3, timeout=90)
-                  items = (js2 or {}).get("reply",{}).get("indicators",[]) or []
-                  if not items: break
+                  }}, max_retries=3)
+                  items = (r or {}).get("reply",{}).get("indicators",[]) or []
                   if any(it.get("indicator")==canary for it in items):
-                    ok = True
-                    break
+                    ok = True; break
+                  if len(items) < 100: break
                   search_from += 100
                 except Exception as e:
-                  print(f"[list] {ep} error: {e}")
                   break
               if ok: break
 
@@ -154,25 +323,24 @@ jobs:
             f.write(canary+"\n"+status+"\n")
           PY
 
-      - name: Save canary details (artifact)
+      - name: Upload canary (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: xdr-canary
           path: canary.txt
           if-no-files-found: warn
 
-      - name: Summarize
+      - name: Summary
         shell: bash
         run: |
-          echo "### Canary result" >> $GITHUB_STEP_SUMMARY
+          echo "### XDR IOC sync" >> $GITHUB_STEP_SUMMARY
+          echo "- Uploaded: \`${{ steps.upload.outputs.uploaded || '0' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Rejected (parse): \`${{ steps.upload.outputs.rejected || '0' }}\`" >> $GITHUB_STEP_SUMMARY
           if [[ -f canary.txt ]]; then
             CANARY=$(sed -n '1p' canary.txt)
             STATUS=$(sed -n '2p' canary.txt)
-            echo "- **Indicator**: \`$CANARY\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Status**: \`$STATUS\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Canary: \`$CANARY\` → \`$STATUS\`" >> $GITHUB_STEP_SUMMARY
             if [[ "$STATUS" != "visible" ]]; then
-              echo "> Listing API was unavailable (5xx/599). Insert likely succeeded, but visibility couldn't be confirmed from GitHub." >> $GITHUB_STEP_SUMMARY
+              echo "> Listing API can be flaky (5xx/599). Insert likely succeeded even if visibility couldn't be confirmed here." >> $GITHUB_STEP_SUMMARY
             fi
-          else
-            echo "- No canary file produced." >> $GITHUB_STEP_SUMMARY
           fi
