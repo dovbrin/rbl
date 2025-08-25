@@ -17,8 +17,8 @@ concurrency:
 
 env:
   VENDOR: "ONO-RBL"
-  SEVERITY: "HIGH"               # INFO | LOW | MEDIUM | HIGH | CRITICAL
-  REPUTATION: "BAD"              # GOOD | BAD | SUSPICIOUS | UNKNOWN | NO_REPUTATION
+  SEVERITY: "HIGH"          # INFO | LOW | MEDIUM | HIGH | CRITICAL
+  REPUTATION: "BAD"         # GOOD | BAD | SUSPICIOUS | UNKNOWN | NO_REPUTATION
   BATCH_SIZE: "500"
   COMMENT_TAG: "Imported from GitHub"
   SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt"
@@ -33,6 +33,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
       - name: Push IOCs to Cortex XDR (inline)
         env:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
@@ -44,7 +49,6 @@ jobs:
           from urllib.parse import urlparse
           import requests
 
-          # --- config from env ---
           BASE   = os.environ["XDR_BASE_URL"].rstrip("/")
           APIID  = os.environ["XDR_API_ID"]
           APIKEY = os.environ["XDR_API_KEY"]
@@ -58,7 +62,6 @@ jobs:
           def hdrs():
               return {"Authorization": APIKEY, "x-xdr-auth-id": APIID, "Content-Type": "application/json"}
 
-          # --- parsers ---
           re_ipv4   = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)$")
           re_md5    = re.compile(r"^[a-fA-F0-9]{32}$")
           re_sha256 = re.compile(r"^[a-fA-F0-9]{64}$")
@@ -80,7 +83,6 @@ jobs:
 
           def classify(token:str):
               t = token
-              # Treat /32 as host; skip other CIDRs
               if re.search(r"/\d{1,2}$", t):
                   if t.endswith("/32"): t = t.rsplit("/",1)[0]
                   else: return None
@@ -91,14 +93,11 @@ jobs:
                   return (host.lower(), "DOMAIN_NAME")
               return None
 
-          # --- read sources ---
-          parsed, rejects = [], []
-          total = 0
+          parsed, rejects, total = [], [], 0
           for path in SOURCES:
               p = pathlib.Path(path)
               if not p.exists():
-                  print(f"[warn] missing file: {p}")
-                  continue
+                  print(f"[warn] missing file: {p}"); continue
               print(f"[src] {p}")
               with open(p, "r", encoding="utf-8", errors="ignore") as f:
                   for line in f:
@@ -107,40 +106,36 @@ jobs:
                       if not s or s.startswith("#"): continue
                       c = classify(s)
                       if c is None:
+                          print(f"[skip] unknown format: {s}")
                           rejects.append({"line": s, "reason": "unrecognized/CIDR/SHA1"})
                           continue
                       parsed.append(c)
 
-          if not parsed and not rejects:
-              print("::warning::No indicators found in provided SOURCES.")
-              sys.exit(0)
-
-          # de-dupe
-          seen = set()
-          items = []
+          seen = set(); items = []
           for val, typ in parsed:
               k = (val, typ)
               if k in seen: continue
               seen.add(k)
               items.append({
                   "indicator": val,
-                  "type": typ,                         # IP | DOMAIN_NAME | HASH | FILENAME
-                  "severity": SEV,                     # INFO/LOW/MEDIUM/HIGH/CRITICAL
-                  "reputation": REP,                   # GOOD/BAD/SUSPICIOUS/UNKNOWN/NO_REPUTATION
+                  "type": typ,
+                  "severity": SEV,
+                  "reputation": REP,
                   "comment": CTAG,
                   "vendor": {"name": VENDOR}
               })
 
           print(f"[parse] lines={total} parsed={len(items)} rejected={len(rejects)}")
 
-          url = f"{BASE}/public_api/v1/indicators/insert_jsons"
+          endpoint = f"{BASE}/public_api/v1/indicators/insert_jsons"
+          print(f"Using endpoint: {endpoint}")
 
           def post_batch(batch):
               payload = {"request_data": {"indicators": batch}}
               backoff = 2
               for attempt in range(1,7):
                   try:
-                      r = requests.post(url, headers=hdrs(), json=payload, timeout=90)
+                      r = requests.post(endpoint, headers=hdrs(), json=payload, timeout=90)
                   except requests.RequestException as e:
                       if attempt == 6: raise SystemExit(f"[batch] network error: {e}")
                       print(f"[net] {e} (attempt {attempt}/6) sleeping {backoff}s")
@@ -152,9 +147,7 @@ jobs:
                       time.sleep(sleep); backoff = min(backoff*2, 60); continue
                   if not r.ok:
                       raise SystemExit(f"[batch] ERROR: HTTP {r.status_code}: {r.text[:400]}")
-                  # Many tenants return just {"reply": true}; accept that
-                  _ = r.json()
-                  return
+                  _ = r.json(); return
 
           uploaded = 0
           for i in range(0, len(items), BSZ):
@@ -163,9 +156,8 @@ jobs:
               post_batch(chunk)
               uploaded += len(chunk)
 
-          # Save rejects as an artifact
           pathlib.Path("artifacts").mkdir(exist_ok=True)
-          with open("artifacts/rejects.json", "w", encoding="utf-8") as f:
+          with open("artifacts/rejects.json","w",encoding="utf-8") as f:
               json.dump({"rejected": rejects}, f, ensure_ascii=False, indent=2)
 
           print(f"[done] uploaded={uploaded} rejected_parse={len(rejects)}")
