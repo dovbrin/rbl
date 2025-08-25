@@ -35,10 +35,9 @@ jobs:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
           XDR_API_ID:   ${{ secrets.XDR_API_ID }}
           XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          # files in repo root:
           SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt"
           VENDOR: "ONO-RBL"
-          SEVERITY: "HIGH"             # INFO|LOW|MEDIUM|HIGH|CRITICAL
+          SEVERITY: "HIGH"
           REPUTATION: "BAD"
           COMMENT_TAG: "Imported from GitHub"
           BATCH_SIZE: "1000"
@@ -51,7 +50,14 @@ jobs:
           API_ID = os.environ["XDR_API_ID"]
           APIKEY = os.environ["XDR_API_KEY"]
 
-          SOURCES = [s.strip() for s in os.environ.get("SOURCES","").split(",") if s.strip()]
+          def coerce_sources(x):
+            if isinstance(x, str):
+              return [s.strip() for s in x.split(",") if s.strip()]
+            if isinstance(x, (list, tuple)):
+              return [str(s).strip() for s in x if str(s).strip()]
+            return []
+
+          SOURCES = coerce_sources(os.environ.get("SOURCES",""))
           VENDOR  = os.environ.get("VENDOR","ONO-RBL")
           SEVERITY= os.environ.get("SEVERITY","HIGH").upper()
           REPUT   = os.environ.get("REPUTATION","BAD").upper()
@@ -69,12 +75,11 @@ jobs:
           }
 
           # ---------- parsers ----------
-          # domain: allow simple FQDN (no scheme), or strip host from URL
           dom_rx = re.compile(r"^[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$")
           hex_rx = re.compile(r"^[0-9a-fA-F]+$")
 
-          rejects = []    # [{source,line,reason,value}]
-          out = []        # list of indicator dicts
+          rejects = []
+          out = []
 
           def add_indicator(ind, typ):
             out.append({
@@ -99,9 +104,7 @@ jobs:
                   rejects.append({"source":src,"line":raw,"reason":"bad URL host","value":host}); return
               except Exception:
                 rejects.append({"source":src,"line":raw,"reason":"bad URL parse","value":s}); return
-            # plain token -> domain?
-            token = s.replace("[.]",".").replace("(.)",".").strip()
-            token = token.replace(" ", "")
+            token = s.replace("[.]",".").replace("(.)",".").replace(" ", "")
             if dom_rx.match(token):
               add_indicator(token.lower(), "DOMAIN_NAME")
             else:
@@ -110,18 +113,16 @@ jobs:
           def parse_ip_line(raw, src):
             s = raw.strip().strip(",;")
             if not s or s.startswith("#"): return
-            # CIDR /32 -> single IP; other CIDRs -> reject
             if "/" in s:
               try:
                 net = ipaddress.ip_network(s, strict=False)
-                if net.prefixlen == net.max_prefixlen:  # /32 for v4 or /128 for v6
+                if net.prefixlen == net.max_prefixlen:
                   add_indicator(str(net.network_address), "IP")
                 else:
                   rejects.append({"source":src,"line":raw,"reason":"CIDR not supported","value":s})
                 return
               except Exception:
                 rejects.append({"source":src,"line":raw,"reason":"bad CIDR","value":s}); return
-            # single IP
             try:
               ip = ipaddress.ip_address(s)
               add_indicator(str(ip), "IP")
@@ -129,23 +130,30 @@ jobs:
               rejects.append({"source":src,"line":raw,"reason":"not an ip","value":s})
 
           def parse_hash_line(raw, src):
-            s = raw.strip().lower()
+            s = raw.strip().lower().strip(",;")
             if not s or s.startswith("#"): return
-            s = s.strip(",;")
             if not hex_rx.match(s):
               rejects.append({"source":src,"line":raw,"reason":"non-hex","value":s}); return
             n = len(s)
-            if n == 32 or n == 40 or n == 64:     # MD5, SHA1, SHA256
+            if n in (32, 40, 64):
               add_indicator(s, "HASH")
             else:
               rejects.append({"source":src,"line":raw,"reason":f"unsupported hash length {n}","value":s})
 
           # ---------- load sources ----------
+          def count_lines(p):
+            try:
+              with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+                return sum(1 for _ in f)
+            except Exception:
+              return 0
+
+          total_lines = 0
           for src in SOURCES:
             p = pathlib.Path(src)
             if not p.exists():
-              # skip missing file quietly
               continue
+            total_lines += count_lines(p)
             with p.open("r", encoding="utf-8", errors="ignore") as f:
               if p.name.lower().startswith("fqdn"):
                 for line in f: parse_domain_line(line, p.name)
@@ -154,26 +162,23 @@ jobs:
               elif p.name.lower().startswith("hash"):
                 for line in f: parse_hash_line(line, p.name)
               else:
-                # guess by content
                 for line in f:
                   t = line.strip()
                   if not t or t.startswith("#"): continue
-                  if "://" in t or "." in t and not any(c in t for c in " /\\"):
+                  if "://" in t or ("." in t and not any(c in t for c in " /\\")):
                     parse_domain_line(line, p.name)
                   elif "/" in t or t.replace(".","").isdigit():
                     parse_ip_line(line, p.name)
                   else:
                     parse_hash_line(line, p.name)
 
-          # dedupe by (indicator,type)
           uniq = {}
           for i in out:
             uniq[(i["indicator"], i["type"])] = i
           indicators = list(uniq.values())
 
-          print(f"[parse] lines={sum(1 for _ in open(SOURCES.split(',')[0]) if _)} parsed={len(indicators)} rejected={len(rejects)}")
+          print(f"[parse] files={len(SOURCES)} lines_total={total_lines} parsed={len(indicators)} rejected={len(rejects)}")
 
-          # ---------- upload in batches ----------
           def post(uri, payload, max_retries=6, timeout=90):
             backoff = 2
             for attempt in range(1, max_retries+1):
@@ -201,14 +206,12 @@ jobs:
                 print("[batch] WARNING: server reply=False (continuing)")
               inserted += len(chunk)
 
-          # write rejects artifact (JSON)
           if rejects:
-            import zipfile, io
+            import zipfile
             pathlib.Path("artifacts").mkdir(exist_ok=True)
             with open("artifacts/rejects.json","w",encoding="utf-8") as f:
               json.dump(rejects, f, ensure_ascii=False, indent=2)
 
-          # set outputs for summary
           print(f"[done] uploaded={inserted} rejected_parse={len(rejects)}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
             gh.write(f"uploaded={inserted}\n")
@@ -233,7 +236,7 @@ jobs:
           COMMENT_TAG:  "GitHub canary"
         run: |
           python - <<'PY'
-          import os, time, requests, json
+          import os, time, requests
           from datetime import datetime, timezone
 
           BASE   = os.environ["XDR_BASE_URL"].rstrip("/")
@@ -270,16 +273,13 @@ jobs:
             "comment": COMMENT, "vendor": {"name": VENDOR}
           }]}}
           try:
-            js = post(f"{BASE}/public_api/v1/indicators/insert_jsons", ins)
-          except Exception as e:
-            status = "insert_failed"
-            print(f"CANARY={canary}\nCANARY_STATUS={status}")
-            open("canary.txt","w").write(canary+"\n"+status+"\n")
+            post(f"{BASE}/public_api/v1/indicators/insert_jsons", ins)
+          except Exception:
+            open("canary.txt","w").write(canary+"\ninsert_failed\n")
             raise
 
-          # Try exact match quickly (12 polls ~2 min)
           ok = False
-          for i in range(12):
+          for _ in range(12):   # ~2 min
             try:
               q = {"request_data":{
                 "search_from":0,"search_to":50,
@@ -289,11 +289,10 @@ jobs:
               items = (r or {}).get("reply",{}).get("indicators",[]) or []
               if any(it.get("indicator")==canary for it in items):
                 ok = True; break
-            except Exception as e:
+            except Exception:
               pass
             time.sleep(10)
 
-          # If not visible via exact match, page newest a bit
           if not ok:
             print("Exact match not visible yet; paging newest endpoints…")
             endpoints = [
@@ -313,12 +312,11 @@ jobs:
                     ok = True; break
                   if len(items) < 100: break
                   search_from += 100
-                except Exception as e:
+                except Exception:
                   break
               if ok: break
 
           status = "visible" if ok else "inconclusive"
-          print(f"CANARY={canary}\nCANARY_STATUS={status}")
           with open("canary.txt","w") as f:
             f.write(canary+"\n"+status+"\n")
           PY
