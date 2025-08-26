@@ -1,0 +1,28 @@
+name: Canary Domain Test
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  run-canary-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run Canary Domain IOC Script
+        env:
+          CORTEX_XDR_API_KEY: ${{ secrets.XDR_API_KEY }}
+          CORTEX_XDR_API_KEY_ID: ${{ secrets.XDR_API_ID }}
+          CORTEX_XDR_FQDN: ${{ secrets.XDR_BASE_URL }}
+        run: python scripts/canary_domain_ioc.py
