@@ -10,7 +10,7 @@ XDR_API_KEY_ID = os.getenv("XDR_API_ID")
 XDR_FQDN = os.getenv("XDR_BASE_URL")
 
 # --- GitHub repository details ---
-GITHUB_REPO_URL = "https://github.com/dovbrin/rbl/main/"
+GITHUB_REPO_URL = "https://github.com/dovbrin/rbl/blob/main/"
 IOC_FILES = ["iplist.txt", "fqdnlist.txt", "hashlist.txt"]
 
 # --- Cortex XDR API endpoint ---
