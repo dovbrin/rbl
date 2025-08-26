@@ -6,6 +6,7 @@ on:
       - main  # or your default branch
     paths:
       - '**.txt' # Trigger when any .txt file is changed
+  workflow_dispatch: # This enables manual triggering
 
 jobs:
   update-cortex-xdr:
