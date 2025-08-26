@@ -41,10 +41,10 @@ def send_ioc_to_cortex(payload):
     """Sends the IOC payload to the Cortex XDR Public API."""
     url = f"https://api-ono.xdr.eu.paloaltonetworks.com/public_api/v1/indicators/insert_jsons"
     headers = {
-        "Authorization": XDR_API_KEY,
-        "x-xdr-auth-id": XDR_API_KEY_ID,
-        "Content-Type": "application/json"
-    }
+    "Authorization": XDR_API_KEY,
+    "x-xdr-auth-id": XDR_API_KEY_ID,  # <-- Use the correct variable name
+    "Content-Type": "application/json"
+}
     
     print(f"Sending IOCs to {url}...")
     
