@@ -1,0 +1,30 @@
+name: Sync IOCs to Cortex XDR
+
+on:
+  push:
+    branches:
+      - main  # or your default branch
+    paths:
+      - '**.txt' # Trigger when any .txt file is changed
+
+jobs:
+  update-cortex-xdr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run IOC update script
+        env:
+          CORTEX_XDR_API_KEY: ${{ secrets.CORTEX_XDR_API_KEY }}
+          CORTEX_XDR_API_KEY_ID: ${{ secrets.CORTEX_XDR_API_KEY_ID }}
+          CORTEX_XDR_FQDN: ${{ secrets.CORTEX_XDR_FQDN }}
+        run: python ioc_updater.py
