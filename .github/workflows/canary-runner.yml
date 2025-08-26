@@ -16,10 +16,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-
+      
       - name: Install dependencies
-        run: pip install -r scripts/requirements.txt
-
+        run: pip install requests
+   
       - name: Run Canary Domain IOC Script
         env:
           CORTEX_XDR_API_KEY: ${{ secrets.XDR_API_KEY }}
