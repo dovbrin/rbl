@@ -1,146 +1,193 @@
-name: Sync RBL to Cortex XDR
+#!/usr/bin/env python3
+"""
+Push indicators from flat files to Cortex XDR via public API.
 
-on:
-  push:
-    paths:
-      - 'fqdnlist.txt'
-      - 'iplist.txt'
-      - 'hashlist.txt'
-      - '.github/workflows/xdr-ioc-sync.yml'
-  workflow_dispatch: {}
+Env:
+  XDR_BASE_URL   (e.g. https://api-ono.xdr.eu.paloaltonetworks.com)
+  XDR_API_ID     (e.g. 16)
+  XDR_API_KEY    (the long API key string)
+  SOURCES        comma-separated file list, e.g. "fqdnlist.txt,iplist.txt,hashlist.txt"
+  VENDOR         e.g. "ONO-RBL"
+  SEVERITY       one of INFO/LOW/MEDIUM/HIGH/CRITICAL (default HIGH)
+  COMMENT_TAG    e.g. "Imported from GitHub"
+  BATCH_SIZE     default 1000
+  FAIL_ON_ERROR  default '0' (do not fail the workflow if some batches error)
 
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+Writes rejects to artifacts/rejects.json
+"""
 
-    steps:
-      - uses: actions/checkout@v4
+import os, sys, re, json, time, pathlib
+from typing import List, Tuple, Dict
+import requests
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+BASE   = os.environ["XDR_BASE_URL"].rstrip("/")
+API_ID = str(os.environ["XDR_API_ID"])
+APIKEY = os.environ["XDR_API_KEY"]
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+SOURCES     = [s.strip() for s in os.environ.get("SOURCES","").split(",") if s.strip()]
+VENDOR      = os.environ.get("VENDOR","ONO-RBL")
+SEVERITY    = os.environ.get("SEVERITY","HIGH").upper()
+COMMENT_TAG = os.environ.get("COMMENT_TAG","Imported from GitHub")
+BATCH_SIZE  = max(1, int(os.environ.get("BATCH_SIZE","1000")))
+FAIL_ON_ERR = os.environ.get("FAIL_ON_ERROR","0") == "1"
 
-      # ---- Upload IOCs ----
-      - name: Push IOCs to Cortex XDR
-        env:
-          XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
-          XDR_API_ID:   ${{ secrets.XDR_API_ID }}
-          XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt"
-          VENDOR: ONO-RBL
-          SEVERITY: HIGH
-          BATCH_SIZE: '1000'
-          COMMENT_TAG: Imported from GitHub
-          FAIL_ON_ERROR: '0'     # don't fail the job if listing APIs are down
-        run: |
-          python xdr_ioc_upsert_from_sources.py || true
+HEADERS = {
+    "Authorization": APIKEY,
+    "x-xdr-auth-id": API_ID,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
 
-      # ---- Upload parse/API rejects (if any) ----
-      - name: Upload rejects (if any)
-        uses: actions/upload-artifact@v4
-        with:
-          name: xdr-rejects
-          path: artifacts/rejects.json
-          if-no-files-found: warn
+ALLOWED_SEV = {"INFO","LOW","MEDIUM","HIGH","CRITICAL"}
 
-      # ---- Canary insert + verify (best-effort) ----
-      - name: Insert canary IOC & try to verify
-        id: canary
-        env:
-          XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
-          XDR_API_ID:   ${{ secrets.XDR_API_ID }}
-          XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          VENDOR:       ONO-RBL
-          COMMENT_TAG:  "GitHub sync test"
-        run: |
-          python - <<'PY'
-          import os, sys, time, json, requests
-          from datetime import datetime, timezone
+# ---------- parsing helpers ----------
+_re_ipv4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_re_md5  = re.compile(r"^[A-Fa-f0-9]{32}$")
+_re_sha1 = re.compile(r"^[A-Fa-f0-9]{40}$")
+_re_sha256 = re.compile(r"^[A-Fa-f0-9]{64}$")
+# lenient domain (no protocol, no spaces)
+_re_domain = re.compile(r"^(?=.{1,253}$)(?!\-)([A-Za-z0-9\-]{1,63}\.)+[A-Za-z0-9\-]{2,63}$")
 
-          BASE   = os.environ["XDR_BASE_URL"].rstrip("/")
-          API_ID = os.environ["XDR_API_ID"]
-          APIKEY = os.environ["XDR_API_KEY"]
-          VENDOR = os.getenv("VENDOR","ONO-RBL")
-          COMMENT= os.getenv("COMMENT_TAG","GitHub sync test")
+def classify(line: str) -> Tuple[str,str]:
+    """
+    Returns (type, indicator) or ("","") if reject.
+    - Skips CIDR (contains '/')
+    - Skips obvious URLs (contains '://')
+    - Skips lines with spaces or leading '#'
+    """
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return "",""
+    # common junk at end
+    s = s.rstrip(",;")
+    # reject URL/CIDR
+    if "://" in s or "/" in s:
+        return "",""
+    # unicode oddities: normalize dot or chars
+    s = s.replace("ọ","o").replace("’","'").replace("`","'").strip()
 
-          H = {
-            "Authorization": APIKEY,
-            "x-xdr-auth-id": str(API_ID),
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-          }
+    # IP?
+    if _re_ipv4.match(s):
+        # light bound check
+        parts = [int(p) for p in s.split(".")]
+        if all(0 <= p <= 255 for p in parts):
+            return "IP", s
+        return "",""
 
-          def post(url, payload, max_retries=6, timeout=120):
-            back = 2
-            for i in range(1, max_retries+1):
-              try:
-                r = requests.post(url, headers=H, json=payload, timeout=timeout)
-                if r.status_code in (429,500,502,503,504,599):
-                  ra = r.headers.get("Retry-After")
-                  sleep = int(ra) if ra and ra.isdigit() else back
-                  print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {i}/{max_retries})")
-                  time.sleep(sleep); back = min(int(back*2.2), 90); continue
-                r.raise_for_status()
-                try: return r.json()
-                except: return {}
-              except requests.RequestException as e:
-                if i == max_retries: raise
-                print(f"[retry] {e}; backoff {back}s")
-                time.sleep(back); back = min(int(back*2.2), 90)
+    # HASH?
+    if _re_md5.match(s) or _re_sha1.match(s) or _re_sha256.match(s):
+        return "HASH", s.lower()
 
-          canary = f"ono-rbl-canary-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.example"
-          ins_body = {"request_data":{"indicators":[{
-            "indicator":canary, "type":"DOMAIN_NAME",
-            "severity":"MEDIUM", "reputation":"BAD",
-            "comment":COMMENT, "vendor":{"name":VENDOR}
-          }]}}
-          print(f"[insert] {canary}")
-          post(f"{BASE}/public_api/v1/indicators/insert_jsons", ins_body)
+    # DOMAIN?
+    # allow leading '*.' by stripping it (XDR expects bare FQDNs)
+    s_dom = s[2:] if s.startswith("*.") else s
+    if _re_domain.match(s_dom):
+        return "DOMAIN_NAME", s_dom.lower()
 
-          ok = False
-          get_url = f"{BASE}/public_api/v1/indicators/get"
-          q = {"request_data":{
-            "search_from":0,"search_to":50,
-            "filters":[{"field":"indicator","operator":"eq","value":canary}]
-          }}
-          for n in range(12):  # ~2 min
+    return "",""
+
+def parse_sources(files: List[str]) -> Tuple[List[dict], List[dict]]:
+    indicators: List[dict] = []
+    rejects: List[dict] = []
+
+    for path in files:
+        print(f"[src] {path}")
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for ln, raw in enumerate(f, 1):
+                    t, ind = classify(raw)
+                    if not t:
+                        rejects.append({"source": path, "line": ln, "value": raw.strip(), "reason": "unknown/unsupported"})
+                        continue
+                    indicators.append({
+                        "indicator": ind,
+                        "type": t,
+                        "severity": SEVERITY if SEVERITY in ALLOWED_SEV else "HIGH",
+                        "comment": COMMENT_TAG,
+                        "vendor": {"name": VENDOR},
+                    })
+        except FileNotFoundError:
+            print(f"[warn] file not found: {path}")
+        except Exception as e:
+            print(f"[warn] error reading {path}: {e}")
+
+    # de-dup by (type,indicator)
+    seen = set()
+    uniq = []
+    for d in indicators:
+        k = (d["type"], d["indicator"])
+        if k in seen: continue
+        seen.add(k)
+        uniq.append(d)
+
+    print(f"[parse] files={len(files)} lines_total={len(indicators)+len(rejects)} parsed={len(uniq)} rejected={len(rejects)}")
+    return uniq, rejects
+
+# ---------- HTTP with retries ----------
+def post_json(url: str, payload: dict, session: requests.Session, max_retries=6, timeout=120) -> requests.Response:
+    back = 2
+    for i in range(1, max_retries+1):
+        r = None
+        try:
+            r = session.post(url, headers=HEADERS, json=payload, timeout=timeout)
+            if r.status_code in (429,500,502,503,504,599):
+                ra = r.headers.get("Retry-After")
+                sleep = int(ra) if ra and ra.isdigit() else back
+                print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {i}/{max_retries})")
+                time.sleep(sleep); back = min(int(back*2.2), 90)
+                continue
+            r.raise_for_status()
+            return r
+        except requests.RequestException as e:
+            if i == max_retries:
+                raise
+            print(f"[retry] {e}; backoff {back}s")
+            time.sleep(back); back = min(int(back*2.2), 90)
+    return r  # type: ignore
+
+# ---------- main ----------
+def main():
+    if not SOURCES:
+        print("No SOURCES specified.")
+        sys.exit(1)
+
+    items, rejects = parse_sources(SOURCES)
+    pathlib.Path("artifacts").mkdir(exist_ok=True)
+    if rejects:
+        with open("artifacts/rejects.json","w",encoding="utf-8") as f:
+            json.dump(rejects, f, ensure_ascii=False, indent=2)
+
+    url = f"{BASE}/public_api/v1/indicators/insert_jsons"
+    print(f"Using endpoint: {url}")
+
+    uploaded = 0
+    api_errors = 0
+    with requests.Session() as s:
+        for i in range(0, len(items), BATCH_SIZE):
+            chunk = items[i:i+BATCH_SIZE]
+            body = {"request_data": {"indicators": chunk}}
+            lo = i+1; hi = i+len(chunk)
+            print(f"[batch] {lo}-{hi} / {len(items)}")
             try:
-              js = post(get_url, q, max_retries=3, timeout=90)
-              items = (js or {}).get("reply",{}).get("indicators",[]) or []
-              if any(it.get("indicator")==canary for it in items):
-                ok = True; break
+                r = post_json(url, body, s, max_retries=6, timeout=180)
+                js = {}
+                try:
+                    js = r.json()
+                except Exception:
+                    pass
+                # XDR returns {"reply": true} on success
+                if not js or not js.get("reply", True):
+                    api_errors += len(chunk)
             except Exception as e:
-              print(f"[exact] {e}")
-            time.sleep(10)
+                api_errors += len(chunk)
+                print(f"[batch] ERROR: {e}")
 
-          status = "visible" if ok else "inconclusive"
-          with open("canary.txt","w") as f:
-            f.write(canary+"\n"+status+"\n")
-          print(f"CANARY={canary}\nCANARY_STATUS={status}")
-          PY
+            uploaded += len(chunk)
 
-      - name: Save canary details
-        uses: actions/upload-artifact@v4
-        with:
-          name: xdr-canary
-          path: canary.txt
-          if-no-files-found: warn
+    print(f"[done] uploaded={uploaded} rejected_parse={len(rejects)} api_errors={api_errors}")
+    if api_errors and FAIL_ON_ERR:
+        sys.exit(2)
+    sys.exit(0)
 
-      - name: Summarize
-        shell: bash
-        run: |
-          echo "### XDR IOC Sync" >> $GITHUB_STEP_SUMMARY
-          if [[ -f canary.txt ]]; then
-            CANARY=$(sed -n '1p' canary.txt); STATUS=$(sed -n '2p' canary.txt)
-            echo "- **Canary**: \`$CANARY\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Status**: \`$STATUS\`" >> $GITHUB_STEP_SUMMARY
-            [[ "$STATUS" != "visible" ]] && echo "> Listing API returned 5xx/599; insert likely ok but visibility couldn’t be confirmed from GitHub." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- Canary not produced" >> $GITHUB_STEP_SUMMARY
-          fi
+if __name__ == "__main__":
+    main()
