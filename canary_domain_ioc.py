@@ -42,7 +42,7 @@ def send_ioc_to_cortex(payload):
     url = f"https://api-ono.xdr.eu.paloaltonetworks.com/public_api/v1/indicators/insert_jsons"
     headers = {
         "Authorization": XDR_API_KEY,
-        "x-xdr-auth-id": XDR_API_ID,
+        "x-xdr-auth-id": XDR_API_KEY_ID,
         "Content-Type": "application/json"
     }
     
