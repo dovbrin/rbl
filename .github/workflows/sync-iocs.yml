@@ -5,6 +5,9 @@ on:
     branches:
       - main  # or your default branch
     paths:
+      - 'fqdnlist.txt'
+      - 'iplist.txt'
+      - 'hashlist.txt'
       - '**.txt' # Trigger when any .txt file is changed
   workflow_dispatch: # This enables manual triggering
 
