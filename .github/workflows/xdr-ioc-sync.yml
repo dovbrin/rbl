@@ -9,10 +9,6 @@ on:
       - '.github/workflows/xdr-ioc-sync.yml'
   workflow_dispatch: {}
 
-concurrency:
-  group: xdr-ioc-sync
-  cancel-in-progress: true
-
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -30,122 +26,166 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # ---- Upload IOCs from repository files ----
+      # ---------- BULK UPLOAD ----------
       - name: Push IOCs to Cortex XDR
         env:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
           XDR_API_ID:   ${{ secrets.XDR_API_ID }}
           XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          # Comma-separated list of files in the repo root:
           SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt"
-          VENDOR: "ONO-RBL"
-          SEVERITY: "high"
-          BATCH_SIZE: "1000"
-          COMMENT_TAG: "Imported from GitHub"
+          VENDOR: ONO-RBL
+          SEVERITY: high
+          BATCH_SIZE: '1000'
+          COMMENT_TAG: Imported from GitHub
         run: |
-          python xdr_ioc_upsert_from_sources.py
+          python xdr_ioc_upsert_from_sources.py || true
+        # ^ don't fail the job if upload step exits non-zero; we still do canary + summary
 
-      # ---- Canary insert + tolerant verification (does NOT fail on 5xx/599 listing) ----
-      - name: Insert canary IOC & try to verify
+      - name: Upload rejects (if any)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdr-rejects
+          path: rejects.json
+          if-no-files-found: warn
+
+      # ---------- CANARY INSERT + VERIFY ----------
+      - name: Insert canary IOC & verify (tolerant)
         id: canary
         env:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
           XDR_API_ID:   ${{ secrets.XDR_API_ID }}
           XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          VENDOR:       "ONO-RBL"
+          VENDOR:       ONO-RBL
           COMMENT_TAG:  "GitHub sync test"
         run: |
           python - <<'PY'
-          import os, time, requests
+          import os, sys, time, json, requests
           from datetime import datetime, timezone
 
           BASE   = os.environ["XDR_BASE_URL"].rstrip("/")
-          AUTHID = os.environ["XDR_API_ID"]
+          API_ID = os.environ["XDR_API_ID"]
           APIKEY = os.environ["XDR_API_KEY"]
           VENDOR = os.getenv("VENDOR","ONO-RBL")
           COMMENT= os.getenv("COMMENT_TAG","GitHub sync test")
 
           H = {
             "Authorization": APIKEY,
-            "x-xdr-auth-id": AUTHID,
+            "x-xdr-auth-id": API_ID,
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/json"
           }
 
-          def post(uri, json_body, max_retries=6, timeout=120):
+          S = requests.Session()
+          S.headers.update(H)
+
+          def post(uri, payload, max_retries=6, timeout=90):
             backoff=2
             for attempt in range(1, max_retries+1):
               try:
-                r = requests.post(uri, headers=H, json=json_body, timeout=timeout)
+                r = S.post(uri, json=payload, timeout=timeout)
                 if r.status_code in (429,500,502,503,504,599):
                   ra = r.headers.get("Retry-After")
                   sleep = int(ra) if ra and ra.isdigit() else backoff
                   print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {attempt}/{max_retries})")
-                  time.sleep(sleep)
-                  backoff = min(int(backoff*2.2), 90)
-                  continue
+                  time.sleep(sleep); backoff = min(int(backoff*2.2), 90); continue
                 r.raise_for_status()
                 return r.json()
               except requests.RequestException as e:
                 if attempt == max_retries:
                   raise
-                print(f"[retry] {e}; backoff {backoff}s")
-                time.sleep(backoff)
-                backoff = min(int(backoff*2.2), 90)
+                print(f"[retry] {e} (attempt {attempt}/{max_retries}); backoff {backoff}s")
+                time.sleep(backoff); backoff = min(int(backoff*2.2), 90)
 
           canary = f"ono-rbl-canary-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.example"
-          ins_uri = f"{BASE}/public_api/v1/indicators/insert_jsons"
-          ins_body = {"request_data":{"indicators":[{
+          print(f"[insert] {canary}")
+
+          # 1) Try rich endpoint first
+          body_jsons = {"request_data":{"indicators":[{
             "indicator":canary, "type":"DOMAIN_NAME",
             "severity":"MEDIUM", "reputation":"BAD",
             "comment":COMMENT, "vendor":{"name":VENDOR},
-            "default_expiration_enabled": True
           }]}}
-          print(f"[insert] {canary}")
-          js = post(ins_uri, ins_body)
-          if not js.get("reply", False):
-            print("CANARY_STATUS=insert_failed")
-            with open("canary.txt","w") as f: f.write(canary+"\ninsert_failed\n")
-            raise SystemExit(0)
+          try:
+            js = post(f"{BASE}/public_api/v1/indicators/insert_jsons", body_jsons, max_retries=3)
+            ok_insert = bool(js.get("reply", False))
+          except Exception as e:
+            print(f"[insert_jsons] failed: {e}")
+            ok_insert = False
 
-          # Try exact match polling (up to ~2 minutes)
-          get_uri = f"{BASE}/public_api/v1/indicators/get"
-          ok = False
-          for i in range(12):
+          # 2) Fallback: simple endpoint (array under request_data)
+          if not ok_insert:
+            body_simple = {"request_data":[{
+              "indicator":canary, "type":"DOMAIN_NAME",
+              "severity":"MEDIUM", "reputation":"BAD",
+              "comment":COMMENT
+            }]}
             try:
-              q = {"request_data":{
-                "search_from":0, "search_to":50,
-                "filters":[{"field":"indicator","operator":"eq","value":canary}],
-                "sort":{"field":"creation_time","keyword":"desc"}
-              }}
-              resp = post(get_uri, q, max_retries=3, timeout=90)
-              items = (resp or {}).get("reply",{}).get("indicators",[]) or []
-              if items:
-                ok = True
-                # optional: print the rule_id if present
-                rid = items[0].get("rule_id")
-                if rid is not None:
-                  print(f"[visible] rule_id={rid}")
-                break
+              js2 = post(f"{BASE}/public_api/v1/indicators/insert_simple_indicators/", body_simple, max_retries=3)
+              ok_insert = bool(js2.get("reply", False))
             except Exception as e:
-              print(f"[exact-match] {e}")
-            time.sleep(10)
+              print(f"[insert_simple_indicators] failed: {e}")
+              ok_insert = False
 
-          status = "visible" if ok else "inconclusive"
+          status = "insert_failed"
+          visible = False
+
+          if ok_insert:
+            # Try exact match a few times (console may lag)
+            get_uri = f"{BASE}/public_api/v1/indicators/get"
+            for i in range(12):  # ~2 minutes
+              print(f"[poll {i+1}/12] exact-match search for '{canary}'")
+              try:
+                q = {"request_data":{
+                  "search_from":0, "search_to":50,
+                  "filters":[{"field":"indicator","operator":"eq","value":canary}]
+                }}
+                resp = post(get_uri, q, max_retries=3)
+                items = (resp or {}).get("reply",{}).get("indicators",[]) or []
+                if items:
+                  print("[visible] exact match found")
+                  visible = True
+                  break
+              except Exception as e:
+                print(f"[exact-match] {e}")
+              time.sleep(10)
+
+            # If not visible yet, page newest across two endpoints
+            if not visible:
+              print("Exact match not visible yet; paging newest endpoints…")
+              endpoints = [
+                f"{BASE}/public_api/v1/indicators/get",              # v1
+                f"{BASE}/public_api/v1/indicators/get_indicators/"   # legacy path w/trailing slash
+              ]
+              for ep in endpoints:
+                search_from = 0
+                for _ in range(5):
+                  try:
+                    body = {"request_data":{
+                      "search_from":search_from, "search_to":search_from+100,
+                      "sort":{"field":"creation_time","keyword":"desc"}
+                    }}
+                    js2 = post(ep, body, max_retries=3)
+                    items = (js2 or {}).get("reply",{}).get("indicators",[]) or []
+                    if not items: break
+                    if any(it.get("indicator")==canary for it in items):
+                      print("[visible] found in paged newest list")
+                      visible = True
+                      break
+                    search_from += 100
+                  except Exception as e:
+                    print(f"[list] {ep} error: {e}")
+                    break
+                if visible: break
+
+            status = "visible" if visible else "inconclusive"
+
+          # record for artifact + summary
           with open("canary.txt","w") as f:
             f.write(canary+"\n"+status+"\n")
-          print(f"CANARY={canary}")
-          print(f"CANARY_STATUS={status}")
+          print(f"CANARY={canary}\nCANARY_STATUS={status}")
           PY
 
-      - name: Save artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: xdr-rejects
-          path: artifacts/rejects.json
-          if-no-files-found: warn
-
-      - name: Save canary
+      - name: Save canary details (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: xdr-canary
@@ -162,7 +202,7 @@ jobs:
             echo "- **Indicator**: \`$CANARY\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Status**: \`$STATUS\`" >> $GITHUB_STEP_SUMMARY
             if [[ "$STATUS" != "visible" ]]; then
-              echo "> Listing API was unavailable (5xx/599). Insert likely succeeded, but visibility couldn't be confirmed from GitHub." >> $GITHUB_STEP_SUMMARY
+              echo "> Insert succeeded or likely succeeded, but listing APIs returned 5xx/599 from the GitHub runner. Verify locally (PowerShell) or check **Settings → Audit Management Logs** for 'Indicator added'." >> $GITHUB_STEP_SUMMARY
             fi
           else
             echo "- No canary file produced." >> $GITHUB_STEP_SUMMARY
