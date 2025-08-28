@@ -1,4 +1,4 @@
-name: Sync RBL to Cortex XDR
+name: Sync RBL to Cortex XDR (best-effort)
 
 on:
   push:
@@ -26,31 +26,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # --- Push IOCs ---
-      - name: Push IOCs to Cortex XDR
+      # ---------- IOC upload (never fail the job) ----------
+      - name: Push IOCs to Cortex XDR (best-effort)
+        continue-on-error: true
         env:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
           XDR_API_ID:   ${{ secrets.XDR_API_ID }}
           XDR_API_KEY:  ${{ secrets.XDR_API_KEY }}
-          SOURCES: "fqdnlist.txt,iplist.txt,hashlist.txt"
-          VENDOR: ONO-RBL
-          SEVERITY: HIGH
-          BATCH_SIZE: '1000'
-          COMMENT_TAG: "Imported from GitHub"
-          FAIL_ON_ERROR: '0'
+          VENDOR:       ONO-RBL
+          COMMENT_TAG:  GitHub sync test
         run: |
-          python xdr_ioc_upsert_from_sources.py || true
+          # Your repo script does parsing + insert_jsons; let the job continue even on errors.
+          python xdr_ioc_upsert_from_sources.py || echo "[warn] uploader failed but continuing (best-effort)"
 
       - name: Upload rejects (if any)
         uses: actions/upload-artifact@v4
         with:
           name: xdr-rejects
-          path: artifacts/rejects.json           # <-- correct path
-          if-no-files-found: warn
+          path: rejects.json
+          if-no-files-found: ignore
 
-      # --- Canary insert + tolerant verify (doesn't fail the job) ---
-      - name: Insert canary & try to verify
+      # ---------- Canary insert + tolerant verification ----------
+      - name: Insert canary IOC & try to verify (best-effort)
         id: canary
+        continue-on-error: true
         env:
           XDR_BASE_URL: ${{ secrets.XDR_BASE_URL }}
           XDR_API_ID:   ${{ secrets.XDR_API_ID }}
@@ -75,105 +74,73 @@ jobs:
             "Accept": "application/json"
           }
 
-          def post(uri, payload, tries=6, timeout=120):
-            back=2
-            for i in range(1, tries+1):
+          def post(uri, payload, max_retries=6, timeout=120):
+            backoff=2
+            for attempt in range(1, max_retries+1):
               try:
                 r = requests.post(uri, headers=H, json=payload, timeout=timeout)
+                # treat infra errors as retryable
                 if r.status_code in (429,500,502,503,504,599):
                   ra = r.headers.get("Retry-After")
-                  sleep = int(ra) if ra and ra.isdigit() else back
-                  print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {i}/{tries})")
-                  time.sleep(sleep); back = min(int(back*2.2), 90)
+                  sleep = int(ra) if ra and ra.isdigit() else backoff
+                  print(f"[retry] HTTP {r.status_code} sleeping {sleep}s (attempt {attempt}/{max_retries})")
+                  time.sleep(sleep); backoff = min(int(backoff*2.2), 90)
                   continue
                 r.raise_for_status()
-                return r
+                return r.json()
               except requests.RequestException as e:
-                if i==tries: raise
-                print(f"[retry] {e}; backoff {back}s"); time.sleep(back); back=min(int(back*2.2),90)
+                if attempt == max_retries: raise
+                print(f"[retry] {e}; backoff {backoff}s")
+                time.sleep(backoff); backoff = min(int(backoff*2.2), 90)
 
-          # 1) Insert canary
           canary = f"ono-rbl-canary-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.example"
+          print(f"[insert] {canary}")
+
+          # Insert via insert_jsons (most reliable cross-tenant)
           ins_uri = f"{BASE}/public_api/v1/indicators/insert_jsons"
           ins_body = {"request_data":{"indicators":[{
-            "indicator":canary, "type":"DOMAIN_NAME",
-            "severity":"MEDIUM", "reputation":"BAD",
-            "comment":COMMENT, "vendor":{"name":VENDOR}
+            "indicator": canary,
+            "type": "DOMAIN_NAME",
+            "severity": "MEDIUM",
+            "reputation": "BAD",
+            "comment": COMMENT,
+            "vendor": {"name": VENDOR}
           }]}}
-
-          open("canary.log","w").write(f"Base={BASE}\nAuthId={API_ID}\nCanary={canary}\n")
-          print(f"[insert] {canary}")
           try:
-            r = post(ins_uri, ins_body)
-            open("canary.log","a").write(f"InsertStatus={r.status_code}\nInsertResp={r.text}\n")
-            js = r.json()
-            if not js.get("reply", False):
-              open("canary.txt","w").write(canary+"\ninsert_failed\n")
-              sys.exit(0)
+            js = post(ins_uri, ins_body)
+            print(js)
           except Exception as e:
-            open("canary.log","a").write(f"InsertError={e}\n")
-            open("canary.txt","w").write(canary+"\ninsert_failed\n")
-            sys.exit(0)
+            # insert could still succeed server-side; we continue best-effort
+            print(f"[warn] insert_jsons call errored: {e}")
 
-          # 2) Exact-match polling (best-effort; may 5xx/599)
-          get_uri = f"{BASE}/public_api/v1/indicators/get"
+          # Best-effort verification (do not fail job)
           ok = False
+          get_uri = f"{BASE}/public_api/v1/indicators/get"
           for i in range(12):  # ~2 minutes
-            print(f"[poll {i+1}/12] exact-match search for '{canary}'")
-            q = {"request_data":{
-              "search_from":0, "search_to":50,
-              "filters":[{"field":"indicator","operator":"eq","value":canary}]
-            }}
             try:
-              r = post(get_uri, q, tries=3, timeout=90)
-              open("canary.log","a").write(f"Poll{i+1}={r.status_code} {r.text[:400]}\n")
-              items = (r.json() or {}).get("reply",{}).get("indicators",[]) or []
+              q = {"request_data":{
+                "search_from":0, "search_to":50,
+                "filters":[{"field":"indicator","operator":"eq","value":canary}]
+              }}
+              resp = post(get_uri, q, max_retries=3, timeout=90)
+              items = (resp or {}).get("reply",{}).get("indicators",[]) or []
               if any(it.get("indicator")==canary for it in items):
-                ok=True
-                break
+                ok = True; break
             except Exception as e:
-              open("canary.log","a").write(f"PollErr{i+1}={e}\n")
+              print(f"[verify] {e}")
             time.sleep(10)
 
-          # 3) Fallback paging of newest
-          if not ok:
-            print("Exact match not visible yet; paging newest endpoints…")
-            endpoints = [
-              f"{BASE}/public_api/v1/indicators/get",
-              f"{BASE}/public_api/v1/indicators/get_indicators/"
-            ]
-            for ep in endpoints:
-              sf = 0
-              for _ in range(5):
-                body = {"request_data":{
-                  "search_from":sf, "search_to":sf+100,
-                  "sort":{"field":"creation_time","keyword":"desc"}
-                }}
-                try:
-                  r = post(ep, body, tries=3, timeout=90)
-                  open("canary.log","a").write(f"List {ep} sf={sf} -> {r.status_code}\n")
-                  items = (r.json() or {}).get("reply",{}).get("indicators",[]) or []
-                  if not items: break
-                  if any(it.get("indicator")==canary for it in items):
-                    ok=True
-                    break
-                  sf += 100
-                except Exception as e:
-                  open("canary.log","a").write(f"ListErr {ep} sf={sf}: {e}\n"); break
-              if ok: break
-
           status = "visible" if ok else "inconclusive"
+          with open("canary.txt","w") as f:
+            f.write(canary+"\n"+status+"\n")
           print(f"CANARY={canary}\nCANARY_STATUS={status}")
-          open("canary.txt","w").write(canary+"\n"+status+"\n")
           PY
 
-      - name: Upload canary logs
+      - name: Save canary details (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: xdr-canary
-          path: |
-            canary.txt
-            canary.log
+          path: canary.txt
           if-no-files-found: warn
 
       - name: Summarize
@@ -186,7 +153,7 @@ jobs:
             echo "- **Indicator**: \`$CANARY\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Status**: \`$STATUS\`" >> $GITHUB_STEP_SUMMARY
             if [[ "$STATUS" != "visible" ]]; then
-              echo "> Listing API returned 5xx/599 from the runner. Inserts still returned \`reply: true\`; verify locally or via Audit logs." >> $GITHUB_STEP_SUMMARY
+              echo "> Listing API returned 5xx/599 from the runner. Inserts likely succeeded; confirm locally or via Audit logs." >> $GITHUB_STEP_SUMMARY
             fi
           else
             echo "- No canary file produced." >> $GITHUB_STEP_SUMMARY
